@@ -1,7 +1,6 @@
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from flask import Flask, request, render_template_string
-import threading
 import os
 import urllib.parse
 import yt_dlp
@@ -31,7 +30,6 @@ def extract_direct_url(video_url):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             
-            # কিছু সাইট ডিরেক্ট url দেয়, কিছু manifest_url দেয়
             direct_url = info.get('url')
             if not direct_url and 'formats' in info and len(info['formats']) > 0:
                 direct_url = info['formats'][-1].get('url')
@@ -41,10 +39,22 @@ def extract_direct_url(video_url):
         logger.error(f"Extraction Error: {e}")
         return None
 
-# ================= FLASK ওয়েব পেজ (টেলিগ্রাম মিনি অ্যাপের প্লেয়ার) =================
+# ================= FLASK ওয়েব পেজ ও Webhook =================
+
+# এই লিংকে টেলিগ্রাম সার্ভার থেকে মেসেজ আসবে (Webhook)
+@app.route('/' + BOT_TOKEN, methods=['POST'])
+def getMessage():
+    json_string = request.get_data().decode('utf-8')
+    update = telebot.types.Update.de_json(json_string)
+    bot.process_new_updates([update])
+    return "!", 200
+
+# মেইন পেজে গেলে Webhook সেট হয়ে যাবে
 @app.route('/')
-def index():
-    return "Universal Telegram Player Bot is running!"
+def webhook():
+    bot.remove_webhook()
+    bot.set_webhook(url=HOST_URL + '/' + BOT_TOKEN)
+    return "Universal Telegram Player Bot is running & Webhook is Set!"
 
 @app.route('/player')
 def video_player():
@@ -52,10 +62,8 @@ def video_player():
     if not stream_url:
         return "❌ ভিডিওর কোনো লিংক পাওয়া যায়নি!", 400
     
-    # লিংকটি m3u8 নাকি mp4 সেটি চেক করা
     video_type = "application/x-mpegURL" if ".m3u8" in stream_url else "video/mp4"
 
-    # ওয়েব প্লেয়ারের ডিজাইন (Video.js)
     html = """
     <!DOCTYPE html>
     <html>
@@ -79,7 +87,6 @@ def video_player():
         </div>
         <script src="https://vjs.zencdn.net/8.0.0/video.min.js"></script>
         <script>
-            // টেলিগ্রাম মিনি অ্যাপ ফুলস্ক্রিন করা
             window.Telegram.WebApp.expand();
             var player = videojs('my-player', {
                 fluid: false,
@@ -87,7 +94,7 @@ def video_player():
             });
             player.ready(function() { 
                 this.play().catch(function(error) {
-                    console.log("Autoplay prevented by browser.");
+                    console.log("Autoplay prevented.");
                 });
             });
         </script>
@@ -105,20 +112,18 @@ def send_welcome(message):
 def process_url(message):
     url = message.text.strip()
     if not url.startswith("http"):
-        bot.reply_to(message, "❌ দয়া করে সঠিক (Valid) ভিডিও লিংক দিন।")
+        bot.reply_to(message, "❌ দয়া করে সঠিক ভিডিও লিংক দিন।")
         return
 
     msg = bot.reply_to(message, "🔄 *সার্ভার লিংক প্রসেস করছে, অপেক্ষা করুন...*", parse_mode='Markdown')
 
     try:
-        # লিংক এক্সট্রাক্ট করা হচ্ছে
         direct_url = extract_direct_url(url)
         
         if direct_url:
             encoded_url = urllib.parse.quote(direct_url, safe='')
             player_link = f"{HOST_URL}/player?url={encoded_url}"
             
-            # ওয়েব অ্যাপ বাটন তৈরি
             markup = InlineKeyboardMarkup()
             web_app = WebAppInfo(url=player_link)
             btn = InlineKeyboardButton(text="▶️ সরাসরি প্লে করুন", web_app=web_app)
@@ -134,20 +139,12 @@ def process_url(message):
             bot.edit_message_text(
                 chat_id=message.chat.id, 
                 message_id=msg.message_id, 
-                text="❌ দুঃখিত, এই সাইটের ভিডিও লিংক বের করা যায়নি। সাইটটি হয়তো সুরক্ষিত বা সাপোর্টেড নয়।"
+                text="❌ দুঃখিত, এই সাইটের ভিডিও লিংক বের করা যায়নি।"
             )
             
     except Exception as e:
         bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text=f"❌ Error: {str(e)}")
 
 # ================= সার্ভার রান করা =================
-def run_bot():
-    bot.infinity_polling()
-
 if __name__ == "__main__":
-    # বটকে ব্যাকগ্রাউন্ডে চালু করা হচ্ছে
-    threading.Thread(target=run_bot, daemon=True).start()
-    
-    # ফ্লাস্ক ওয়েব সার্ভার চালু করা হচ্ছে (ক্লাউড পোর্টের সাথে)
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
