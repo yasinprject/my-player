@@ -18,20 +18,18 @@ HOST_URL = os.environ.get('HOST_URL', '').rstrip('/')
 app = Flask(__name__)
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# মেমোরি ক্যাশ 
 video_cache = {}
 
-# ================= 🚀 সুপার এক্সট্রাক্টর (YouTube/FB Bypass) =================
+# ================= 🚀 স্মার্ট এক্সট্রাক্টর (MP4 Priority) =================
 def extract_direct_url(video_url):
     ydl_opts = {
-        # m3u8 ব্লক করে শুধুমাত্র সেরা কোয়ালিটির ডিরেক্ট MP4 ফাইল বের করার কমান্ড
-        'format': 'best[protocol^=http][ext=mp4]/best[protocol^=http]/best',
+        'format': 'best',
         'quiet': True,
         'no_warnings': True,
         'simulate': True,
         'skip_download': True,
         'nocheckcertificate': True,
-        # 🟢 YouTube/FB এর সিকিউরিটি বাইপাস করার জন্য অ্যান্ড্রয়েড ডিভাইস স্পুফিং
+        # YouTube/FB এর সিকিউরিটি ভাঙার জন্য অ্যান্ড্রয়েড স্পুফিং
         'extractor_args': {
             'youtube': {
                 'player_client': ['android', 'web']
@@ -42,20 +40,31 @@ def extract_direct_url(video_url):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             
-            url = info.get('url')
-            if not url and 'formats' in info:
-                valid_formats = [f for f in info['formats'] if f.get('protocol', '').startswith('http')]
-                if valid_formats:
-                    url = valid_formats[-1].get('url')
+            url = None
+            is_m3u8 = False
+            formats = info.get('formats', [])
             
-            # সার্ভারের আসল হেডারগুলো (Cookies/User-Agent) সেভ করা হচ্ছে
+            # প্রথমে সাইটের সার্ভার থেকে সবচেয়ে ভালো MP4 ফাইলটি খোঁজার চেষ্টা
+            valid_mp4s = [f for f in formats if f.get('ext') == 'mp4' and 'm3u8' not in f.get('protocol', '') and 'dash' not in f.get('protocol', '')]
+            if valid_mp4s:
+                url = valid_mp4s[-1].get('url')  # সবচেয়ে হাই-কোয়ালিটি MP4
+            
+            # MP4 না পেলে ডিফল্ট লিংক নেওয়া হবে
+            if not url:
+                url = info.get('url') or (formats[-1].get('url') if formats else None)
+            
+            # লিংকটি m3u8 (HLS) কি না তা চেক করা হচ্ছে
+            protocol = info.get('protocol', '')
+            if 'm3u8' in protocol or (url and '.m3u8' in url.lower()):
+                is_m3u8 = True
+                
             headers = info.get('http_headers', {})
-            return url, headers
+            return url, headers, is_m3u8
     except Exception as e:
         logger.error(f"Extraction Error: {e}")
-        return None, None
+        return None, None, False
 
-# ================= Webhook Setup =================
+# ================= Webhook =================
 @app.route('/' + BOT_TOKEN, methods=['POST'])
 def getMessage():
     json_string = request.get_data().decode('utf-8')
@@ -67,9 +76,9 @@ def getMessage():
 def webhook():
     bot.remove_webhook()
     bot.set_webhook(url=HOST_URL + '/' + BOT_TOKEN, drop_pending_updates=True)
-    return "✅ Masterpiece Player is Live!"
+    return "✅ Smart Hybrid Player is Live!"
 
-# ================= ⚡ বাফার-ফ্রি হাই-স্পিড প্রক্সি =================
+# ================= ⚡ বাফার-ফ্রি প্রক্সি (শুধু MP4 এর জন্য) =================
 @app.route('/stream')
 def stream_video():
     vid_id = request.args.get('v')
@@ -79,10 +88,7 @@ def stream_video():
         return "Video Session Expired", 404
     
     url = vid_data['url']
-    original_headers = vid_data['headers']
-    
-    # yt-dlp এর অরিজিনাল হেডারগুলো ব্যবহার করা হচ্ছে যাতে সাইট ব্লক না করে
-    req_headers = {k: v for k, v in original_headers.items()}
+    req_headers = {k: v for k, v in vid_data['headers'].items()}
     
     if request.headers.get('Range'):
         req_headers['Range'] = request.headers.get('Range')
@@ -91,8 +97,7 @@ def stream_video():
         r = requests.get(url, headers=req_headers, stream=True, verify=False, allow_redirects=True, timeout=10)
         
         def generate():
-            # ২৫৬ কেবি চাংক সাইজ - এটি ক্লাউড সার্ভারের জন্য সবচেয়ে স্মুথ বাফার-ফ্রি এক্সপেরিয়েন্স দেবে
-            for chunk in r.iter_content(chunk_size=262144): 
+            for chunk in r.iter_content(chunk_size=262144): # 256KB Chunk for smooth streaming
                 if chunk: yield chunk
 
         headers_to_pass = []
@@ -106,16 +111,20 @@ def stream_video():
         logger.error(f"Proxy Error: {e}")
         return "Streaming Error", 500
 
-# ================= Native HTML5 Player (Fastest) =================
+# ================= 🎬 Hybrid Smart Player (HLS + MP4) =================
 @app.route('/player')
 def video_player():
     vid_id = request.args.get('v')
-    if not video_cache.get(vid_id):
-        return "<h2 style='color:red; text-align:center; margin-top:50px;'>❌ সেশন শেষ! নতুন লিংক দিন।</h2>", 400
+    vid_data = video_cache.get(vid_id)
     
-    proxy_url = f"{HOST_URL}/stream?v={vid_id}"
+    if not vid_data:
+        return "<h2 style='color:red; text-align:center; font-family:sans-serif; margin-top:50px;'>❌ সেশন শেষ! টেলিগ্রামে গিয়ে নতুন লিংক দিন।</h2>", 400
+    
+    is_m3u8 = vid_data['is_m3u8']
+    
+    # যদি m3u8 হয়, সরাসরি অরিজিনাল লিংক প্লেয়ারে যাবে। আর mp4 হলে প্রক্সি হয়ে যাবে।
+    stream_url = vid_data['url'] if is_m3u8 else f"{HOST_URL}/stream?v={vid_id}"
 
-    # থার্ড-পার্টি প্লেয়ার বাদ দিয়ে নেটিভ প্লেয়ার দেওয়া হলো, যাতে কোনো ল্যাগ না করে
     html = """
     <!DOCTYPE html>
     <html lang="en">
@@ -124,30 +133,47 @@ def video_player():
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
         <title>Telegram Smart Player</title>
         <script src="https://telegram.org/js/telegram-web-app.js"></script>
+        <!-- HLS.js লাইব্রেরি -->
+        <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
         <style>
             body { margin: 0; padding: 0; background: #000; height: 100vh; display: flex; justify-content: center; align-items: center; overflow: hidden; }
             video { width: 100%; max-height: 100vh; outline: none; background: #000; }
         </style>
     </head>
     <body>
-        <video id="video" controls playsinline preload="auto">
-            <source src="{{ proxy_url }}" type="video/mp4">
-        </video>
+        <video id="video" controls playsinline preload="auto"></video>
         <script>
             window.Telegram.WebApp.expand();
             window.Telegram.WebApp.ready();
+            
             var video = document.getElementById('video');
-            video.play().catch(e => console.log("Autoplay blocked"));
+            var source = "{{ stream_url }}";
+            var is_m3u8 = "{{ is_m3u8 }}" === "True";
+
+            // যদি ভিডিও m3u8 হয়, HLS.js দিয়ে ডিকোড করা হবে
+            if (is_m3u8 && Hls.isSupported()) {
+                var hls = new Hls({ maxMaxBufferLength: 30 });
+                hls.loadSource(source);
+                hls.attachMedia(video);
+                hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                    video.play().catch(e => console.log("Autoplay blocked"));
+                });
+            } 
+            // যদি Apple Device হয় অথবা ডিরেক্ট MP4 হয়
+            else {
+                video.src = source;
+                video.play().catch(e => console.log("Autoplay blocked"));
+            }
         </script>
     </body>
     </html>
     """
-    return render_template_string(html, proxy_url=proxy_url)
+    return render_template_string(html, stream_url=stream_url, is_m3u8=is_m3u8)
 
 # ================= বট কমান্ডস =================
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🌍 **Ultimate Video Player Bot**\n\nYouTube, Facebook বা যেকোনো সাইটের ভিডিও লিংক দিন!")
+    bot.reply_to(message, "🌍 **Ultimate Video Player Bot**\n\nYouTube, Facebook, xHamster বা যেকোনো সাইটের ভিডিও লিংক দিন!")
 
 @bot.message_handler(func=lambda message: True)
 def process_url(message):
@@ -156,14 +182,14 @@ def process_url(message):
         bot.reply_to(message, "❌ সঠিক ভিডিও লিংক দিন।")
         return
 
-    msg = bot.reply_to(message, "🔄 *সার্ভার হাই-কোয়ালিটি লিংক খুঁজছে...*", parse_mode='Markdown')
+    msg = bot.reply_to(message, "🔄 *সার্ভার লিংক প্রসেস করছে...*", parse_mode='Markdown')
 
     try:
-        extracted_url, headers = extract_direct_url(url)
+        extracted_url, headers, is_m3u8 = extract_direct_url(url)
         
         if extracted_url:
             vid_id = str(uuid.uuid4())[:8]
-            video_cache[vid_id] = {'url': extracted_url, 'headers': headers}
+            video_cache[vid_id] = {'url': extracted_url, 'headers': headers, 'is_m3u8': is_m3u8}
             
             player_link = f"{HOST_URL}/player?v={vid_id}"
             
@@ -172,7 +198,7 @@ def process_url(message):
             
             bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text="✅ ভিডিও প্রস্তুত! নিচের বাটনে ক্লিক করে প্লে করুন।", reply_markup=markup)
         else:
-            bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text="❌ লিংক বের করা যায়নি। ভিডিওটি হয়তো প্রাইভেট অথবা সাইট ব্লক করেছে।")
+            bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text="❌ লিংক বের করা যায়নি।")
     except Exception as e:
         bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text=f"❌ Error: {str(e)}")
 
