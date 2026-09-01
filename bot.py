@@ -2,22 +2,25 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from flask import Flask, request, render_template_string
 import os
-import urllib.parse
 import yt_dlp
 import logging
+import uuid
+import threading
 
 # ================= কনফিগারেশন =================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Environment Variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN', 'আপনার_বট_টোকেন')
 HOST_URL = os.environ.get('HOST_URL', 'https://আপনার-ক্লাউড-লিংক.com').rstrip('/')
 
 app = Flask(__name__)
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ================= ভিডিও লিংক এক্সট্রাক্টর (yt-dlp) =================
+# বিশাল লিংকগুলো সেভ রাখার জন্য ডিকশনারি (Cache)
+video_cache = {}
+
+# ================= ভিডিও লিংক এক্সট্রাক্টর =================
 def extract_direct_url(video_url):
     ydl_opts = {
         'format': 'best',
@@ -41,15 +44,15 @@ def extract_direct_url(video_url):
 
 # ================= FLASK ওয়েব পেজ ও Webhook =================
 
-# এই লিংকে টেলিগ্রাম সার্ভার থেকে মেসেজ আসবে (Webhook)
 @app.route('/' + BOT_TOKEN, methods=['POST'])
 def getMessage():
     json_string = request.get_data().decode('utf-8')
     update = telebot.types.Update.de_json(json_string)
-    bot.process_new_updates([update])
+    
+    # থ্রেডিং ব্যবহার করা হলো যাতে টেলিগ্রাম দ্রুত রেসপন্স পায় এবং না আটকে যায়
+    threading.Thread(target=bot.process_new_updates, args=([update],)).start()
     return "!", 200
 
-# মেইন পেজে গেলে Webhook সেট হয়ে যাবে
 @app.route('/')
 def webhook():
     bot.remove_webhook()
@@ -58,9 +61,12 @@ def webhook():
 
 @app.route('/player')
 def video_player():
-    stream_url = request.args.get('url')
+    # ছোট আইডি দিয়ে ডিকশনারি থেকে আসল বিশাল লিংকটি বের করা হচ্ছে
+    vid_id = request.args.get('v')
+    stream_url = video_cache.get(vid_id)
+    
     if not stream_url:
-        return "❌ ভিডিওর কোনো লিংক পাওয়া যায়নি!", 400
+        return "<h2 style='color:white; text-align:center; font-family:sans-serif; margin-top:50px;'>❌ সেশন শেষ হয়ে গেছে! বটে গিয়ে আবার লিংক দিন।</h2>", 400
     
     video_type = "application/x-mpegURL" if ".m3u8" in stream_url else "video/mp4"
 
@@ -94,7 +100,7 @@ def video_player():
             });
             player.ready(function() { 
                 this.play().catch(function(error) {
-                    console.log("Autoplay prevented.");
+                    console.log("Autoplay prevented by browser.");
                 });
             });
         </script>
@@ -115,14 +121,18 @@ def process_url(message):
         bot.reply_to(message, "❌ দয়া করে সঠিক ভিডিও লিংক দিন।")
         return
 
-    msg = bot.reply_to(message, "🔄 *সার্ভার লিংক প্রসেস করছে, অপেক্ষা করুন...*", parse_mode='Markdown')
+    msg = bot.reply_to(message, "🔄 *লিংক প্রসেস করা হচ্ছে, অপেক্ষা করুন...*", parse_mode='Markdown')
 
     try:
         direct_url = extract_direct_url(url)
         
         if direct_url:
-            encoded_url = urllib.parse.quote(direct_url, safe='')
-            player_link = f"{HOST_URL}/player?url={encoded_url}"
+            # বিশাল লিংকের বদলে একটি ছোট আইডি তৈরি করা হচ্ছে (যেমন: a4f8b9)
+            vid_id = str(uuid.uuid4())[:8]
+            video_cache[vid_id] = direct_url 
+            
+            # টেলিগ্রামকে শুধু ছোট লিংকটি দেওয়া হচ্ছে
+            player_link = f"{HOST_URL}/player?v={vid_id}"
             
             markup = InlineKeyboardMarkup()
             web_app = WebAppInfo(url=player_link)
@@ -136,11 +146,7 @@ def process_url(message):
                 reply_markup=markup
             )
         else:
-            bot.edit_message_text(
-                chat_id=message.chat.id, 
-                message_id=msg.message_id, 
-                text="❌ দুঃখিত, এই সাইটের ভিডিও লিংক বের করা যায়নি।"
-            )
+            bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text="❌ দুঃখিত, এই সাইটের ভিডিও লিংক বের করা যায়নি।")
             
     except Exception as e:
         bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text=f"❌ Error: {str(e)}")
